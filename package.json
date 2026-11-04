@@ -1,0 +1,8 @@
+{
+  "name": "free-agent",
+  "version": "1.0.0",
+  "description": "A Claude-Code-style coding agent with a web GUI for Termux, powered by free OpenAI-compatible providers.",
+  "bin": { "fa": "bin/fa.js" },
+  "engines": { "node": ">=18" },
+  "license": "MIT"
+}

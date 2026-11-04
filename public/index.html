@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Free Agent</title>
+<style>
+:root{--bg:#0f1115;--panel:#171a21;--line:#272c36;--tx:#e6e8ec;--mut:#8b93a1;--ac:#7c9cff;--ok:#4ade80;--er:#f87171}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--tx);font:15px/1.5 system-ui,sans-serif;display:flex;flex-direction:column}
+header{display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
+header b{font-size:16px}.cwd{color:var(--mut);font-size:12px;flex:1;min-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+select,button,input,textarea{background:#1f2430;color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit}
+button{cursor:pointer}button:hover{border-color:var(--ac)}button.pri{background:var(--ac);color:#0b0e14;border-color:var(--ac);font-weight:600}
+select{max-width:46vw}label.t{font-size:13px;color:var(--mut);display:flex;gap:5px;align-items:center}
+#log{flex:1;overflow:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
+.m{max-width:900px;width:100%;margin:0 auto;padding:10px 14px;border-radius:10px;background:var(--panel);border:1px solid var(--line);white-space:pre-wrap;word-break:break-word}
+.m.user{background:#1c2540;border-color:#2c3a66}.m.err{border-color:var(--er);color:var(--er)}.m.sys{color:var(--mut);background:none;border:none}
+.tool{font:13px ui-monospace,monospace;color:var(--mut);border-left:3px solid var(--ac);background:#12151b;padding:6px 10px;border-radius:6px}
+.tool pre{margin:6px 0 0;max-height:160px;overflow:auto;white-space:pre-wrap;color:#b8c0cc}
+.ap{display:flex;gap:8px;margin-top:8px}
+pre.code{background:#0b0d12;padding:10px;border-radius:8px;overflow:auto;margin:6px 0}code{background:#0b0d12;padding:1px 5px;border-radius:4px}
+.pl{margin:6px 0}.pl h4{margin:8px 0 4px}.chip{display:inline-block;margin:2px;padding:2px 8px;border:1px solid var(--line);border-radius:99px;font-size:13px;cursor:pointer}
+.chip:hover{border-color:var(--ac)}.star{color:#fbbf24}
+footer{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--line);background:var(--panel)}
+textarea{flex:1;resize:none;height:46px;max-height:30vh}
+dialog{background:var(--panel);color:var(--tx);border:1px solid var(--line);border-radius:12px;max-width:560px;width:92vw}
+dialog::backdrop{background:#000a}.row{display:flex;gap:6px;margin:6px 0;align-items:center}.row input{flex:1;min-width:0}.row span{width:150px;font-size:13px}
+a{color:var(--ac)}.ok{color:var(--ok)}
+</style></head><body>
+<header>
+  <b>Free Agent</b><span class="cwd" id="cwd"></span>
+  <select id="sel" title="Model"></select>
+  <button id="ref" title="Re-check all models in all your APIs">↻ Models</button>
+  <label class="t"><input type="checkbox" id="auto"> auto-approve</label>
+  <button id="cfg">⚙</button>
+</header>
+<main id="log"></main>
+<footer><textarea id="inp" placeholder="Ask the agent to build or fix something…  (/models lists all AIs, /clear resets)"></textarea><button class="pri" id="go">Send</button></footer>
+<dialog id="dlg"><h3 style="margin-top:0">API keys</h3><div id="plist"></div>
+<h4>Custom OpenAI-compatible provider</h4>
+<div class="row"><input id="cn" placeholder="name"><input id="cu" placeholder="https://host/v1"></div>
+<div class="row"><input id="ck" type="password" placeholder="API key (optional)"><button id="ca">Add</button></div>
+<div class="row" style="justify-content:flex-end"><button class="pri" id="cl">Done</button></div></dialog>
+<script>
+const q=new URLSearchParams(location.search);if(q.get('t')){localStorage.fa_t=q.get('t');history.replaceState(null,'','/')}
+const H={'x-token':localStorage.fa_t||'','content-type':'application/json'};
+const api=(p,b)=>fetch(p,b===undefined?{headers:H}:{method:'POST',headers:H,body:JSON.stringify(b)}).then(r=>r.json());
+const $=i=>document.getElementById(i),log=$('log'),sel=$('sel'),inp=$('inp');
+let sid=crypto.randomUUID?crypto.randomUUID():String(Math.random()),busy=false,ac=null,D=null;
+const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const md=s=>esc(s).replace(/```(?:\w+)?\n?([\s\S]*?)```/g,(_,c)=>'<pre class="code">'+c+'</pre>').replace(/`([^`\n]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>');
+function add(cls,html){const d=document.createElement('div');d.className='m '+cls;d.innerHTML=html;log.appendChild(d);log.scrollTop=log.scrollHeight;return d}
+function tool(html){const d=document.createElement('div');d.className='m tool';d.innerHTML=html;log.appendChild(d);log.scrollTop=log.scrollHeight;return d}
+
+async function loadModels(force){
+  sel.innerHTML='<option>checking models…</option>';
+  try{D=await api('/api/models'+(force?'?refresh=1':''))}catch(e){D={providers:[],best:null}}
+  const saved=localStorage.fa_m;let html='',have=false;
+  for(const p of D.providers){if(!p.models.length)continue;
+    html+=`<optgroup label="${esc(p.label)} (${p.models.length})">`+p.models.map((m,i)=>{const v=p.id+'|'+m.id;if(v===saved)have=true;return `<option value="${esc(v)}">${i<2?'★ ':''}${esc(m.id)}</option>`}).join('')+'</optgroup>'}
+  sel.innerHTML=html||'<option value="">no models – add an API key (⚙)</option>';
+  if(have)sel.value=saved;else if(D.best)sel.value=D.best.provider+'|'+D.best.id;
+  localStorage.fa_m=sel.value;return D;
+}
+sel.onchange=()=>localStorage.fa_m=sel.value;
+function listHtml(){let h='';
+  if(!D||!D.providers.length)return 'No providers with keys yet. Open ⚙ and add at least one free API key.';
+  for(const p of D.providers){h+=`<div class="pl"><h4>${esc(p.label)} ${p.ok?`<span class="ok">✓ ${p.models.length} models</span>`:`<span style="color:var(--er)">✗ ${esc(p.error)}</span>`}</h4>`+p.models.map((m,i)=>`<span class="chip" data-v="${esc(p.id+'|'+m.id)}">${i<2?'<span class="star">★</span> ':''}${esc(m.id)}</span>`).join('')+'</div>'}
+  return h+'<div style="color:var(--mut);font-size:13px">★ = best ranked for agent/coding work. Click a model to use it.</div>';
+}
+async function showModels(force){const d=add('sys','Checking every provider you have a key for…');await loadModels(force);d.className='m';d.innerHTML=listHtml();
+  d.querySelectorAll('.chip').forEach(c=>c.onclick=()=>{sel.value=c.dataset.v;localStorage.fa_m=sel.value;add('sys','Model set to '+esc(c.dataset.v))})}
+
+async function send(){
+  const text=inp.value.trim();if(!text||busy)return;inp.value='';
+  if(text==='/models')return showModels(true);
+  if(text==='/clear'){await api('/api/reset',{sid});sid=String(Math.random());log.innerHTML='';return}
+  if(!sel.value)return add('err','No model selected. Add an API key in ⚙ first.');
+  const [provider,...r]=sel.value.split('|'),model=r.join('|');
+  add('user',esc(text));busy=true;$('go').textContent='Stop';ac=new AbortController();
+  try{
+    const res=await fetch('/api/chat',{method:'POST',headers:H,signal:ac.signal,body:JSON.stringify({sid,text,provider,model,auto:$('auto').checked})});
+    if(!res.ok){add('err',esc((await res.json()).error||res.status));throw 0}
+    const rd=res.body.getReader(),dec=new TextDecoder();let buf='';
+    for(;;){const{done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;
+      while((i=buf.indexOf('\n'))>=0){const l=buf.slice(0,i);buf=buf.slice(i+1);if(l)ev(JSON.parse(l))}}
+  }catch(e){if(e&&e.name==='AbortError')add('sys','Stopped.')}
+  busy=false;$('go').textContent='Send';
+}
+let lastTool=null;
+function ev(e){
+  if(e.type==='text')add('',md(e.text));
+  else if(e.type==='tool'){const a=e.args||{};lastTool=tool('⚙ <b>'+esc(e.name)+'</b> '+esc(e.name==='bash'?a.command:(a.path||'')))}
+  else if(e.type==='result'&&lastTool){lastTool.insertAdjacentHTML('beforeend','<pre>'+esc(e.output)+'</pre>')}
+  else if(e.type==='error')add('err',esc(e.message));
+  else if(e.type==='approval'){const a=e.args||{};const d=tool('🔒 Allow <b>'+esc(e.name)+'</b>?<pre>'+esc(e.name==='bash'?a.command:JSON.stringify(a,null,1).slice(0,1500))+'</pre><div class="ap"><button class="pri">Allow</button><button>Deny</button></div>');
+    const [y,n]=d.querySelectorAll('button');const done=ok=>{api('/api/approve',{id:e.id,ok});d.querySelector('.ap').remove();lastTool=d};y.onclick=()=>done(true);n.onclick=()=>done(false)}
+}
+$('go').onclick=()=>busy?ac.abort():send();
+inp.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!/Android|iPhone/i.test(navigator.userAgent)){e.preventDefault();send()}};
+$('ref').onclick=()=>showModels(true);
+
+async function cfg(){
+  const L=await api('/api/config');const box=$('plist');box.innerHTML='';
+  for(const p of L){const r=document.createElement('div');r.className='row';
+    r.innerHTML=`<span>${esc(p.label)}${p.hasKey?' <b class="ok">✓</b>':''}</span>`+(p.nokey&&!p.custom?'<i style="flex:1;color:var(--mut);font-size:13px">no key needed</i>':`<input type="password" placeholder="${p.hasKey?'saved – paste to replace':'paste free API key'}">`)+(p.signup?`<a href="${esc(p.signup)}" target="_blank" rel="noopener">get key</a>`:'')+(p.custom?'<button>✕</button>':'');
+    const i=r.querySelector('input'),b=r.querySelector('button');
+    if(i)i.onchange=async()=>{await api('/api/config',{id:p.id,key:i.value});i.value='';cfg()};
+    if(b)b.onclick=async()=>{await api('/api/config',{remove:p.id});cfg()};
+    box.appendChild(r)}
+}
+$('cfg').onclick=()=>{cfg();$('dlg').showModal()};
+$('ca').onclick=async()=>{if(!$('cn').value||!$('cu').value)return;await api('/api/config',{custom:{id:$('cn').value,label:$('cn').value,base:$('cu').value,key:$('ck').value}});$('cn').value=$('cu').value=$('ck').value='';cfg()};
+$('cl').onclick=async()=>{$('dlg').close();await showModels(true)};
+(async()=>{
+  try{$('cwd').textContent=(await api('/api/info')).cwd}catch{}
+  const d=await loadModels(false);
+  if(!d.providers.length){add('sys','Welcome! Add at least one free API key (OpenRouter, Groq, Google AI Studio, Cerebras…) to start.');$('dlg').showModal();cfg()}
+  else{add('sys','Ready. Using '+esc(sel.value.replace('|',' → '))+'. Type /models to see every AI available to you.')}
+})();
+</script></body></html>
