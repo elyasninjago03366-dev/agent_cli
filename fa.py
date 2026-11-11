@@ -290,12 +290,20 @@ def run_agent(state):
 def add_keys():
     lst = [p for p in providers().values() if not p.get('nokey')]
     while True:
-        print('\n' + bold('Add a free API key') + dim('  (blank = done)'))
+        print('\n' + bold('Add a free API key') + dim('  (blank = done, p = add your own provider with a base URL)'))
         for i, p in enumerate(lst, 1):
             print(f"  {i}. {p['label']:<26} {gr('✓ saved') if p['key'] else dim(p['signup'])}")
-        n = input('provider number> ').strip()
+        try:
+            n = input('provider number> ').strip()
+        except EOFError:
+            return
         if not n:
             return
+        if n.lower() == 'p':
+            manage_providers()
+            lst = [q for q in providers().values() if not q.get('nokey') or q.get('custom')]
+            lst = [q for q in lst if not q.get('custom')]
+            continue
         if not n.isdigit() or not 1 <= int(n) <= len(lst):
             print(rd('invalid number'))
             continue
@@ -306,6 +314,62 @@ def add_keys():
             set_key(p['id'], k)
             lst = [q for q in providers().values() if not q.get('nokey')]
             print(gr('saved ✓'))
+
+
+def manage_providers():
+    """Add / remove custom OpenAI-compatible providers (name + base URL + key) by hand."""
+    while True:
+        cfg = load()
+        custom = cfg.get('custom') or []
+        print('\n' + bold('Custom providers') + dim('  (any OpenAI-compatible API)'))
+        if custom:
+            for i, x in enumerate(custom, 1):
+                print(f"  {i}. {x['label']:<20} {dim(x['base'])}  {gr('key ✓') if x.get('key') else dim('no key')}")
+        else:
+            print(dim('  none yet'))
+        print('\n  a = add new   r = remove   (blank = done)')
+        try:
+            ch = input('provider> ').strip().lower()
+        except EOFError:
+            return
+        if not ch:
+            return
+        if ch == 'a':
+            name = input('name (e.g. myhost)> ').strip()
+            base = input('base URL (e.g. https://api.example.com/v1)> ').strip().rstrip('/')
+            if not name or not base:
+                print(rd('name and base URL are required'))
+                continue
+            if not re.match(r'^https?://', base):
+                base = 'https://' + base
+            if base.endswith('/chat/completions'):
+                base = base[:-len('/chat/completions')]
+            key = input('API key (blank if none)> ').strip()
+            pid = re.sub(r'[^\w-]', '', name).lower() or 'custom'
+            if pid in BUILTIN:
+                pid += '-custom'
+            custom = [x for x in custom if x['id'] != pid]
+            custom.append({'id': pid, 'label': name, 'base': base, 'key': key})
+            cfg['custom'] = custom
+            save(cfg)
+            print(gr(f'saved ✓ "{name}"') + dim(' — checking it…'))
+            try:
+                ms = list_models(dict(id=pid, label=name, base=base, key=key))
+                print(gr(f'works: {len(ms)} models found'))
+            except Exception as e:
+                print(yl(f'saved, but the model list failed: {str(e)[:150]}'))
+                print(dim('check the base URL (it usually ends in /v1) and the key; if the API lists no models, set one by hand: /model ' + pid + ':<model-name>'))
+        elif ch == 'r':
+            if not custom:
+                continue
+            n = input('number to remove> ').strip()
+            if n.isdigit() and 1 <= int(n) <= len(custom):
+                gone = custom.pop(int(n) - 1)
+                cfg['custom'] = custom
+                save(cfg)
+                print(gr('removed ') + gone['label'])
+            else:
+                print(rd('invalid number'))
 
 
 def show(res, cur, everything):
@@ -359,6 +423,13 @@ def main():
 
     def choose(arg):
         nonlocal cur
+        if ':' in arg and arg.split(':', 1)[0] in providers() and arg.split(':', 1)[1]:
+            pid, mid = arg.split(':', 1)
+            cur = {'provider': pid, 'model': mid}
+            cfg = load()
+            cfg['last'] = cur
+            save(cfg)
+            return print(gr('model → ') + f'{pid}/{mid}')
         m = flat[int(arg) - 1] if arg.isdigit() and 0 < int(arg) <= len(flat) else next((x for x in flat if arg.lower() in x['id'].lower()), None)
         if not m:
             return print(rd('no such model — try /models'))
@@ -390,7 +461,9 @@ def main():
             print(f"""
   /models [all]   re-check every API and list all available AIs
   /model <n|name> switch model (number from /models, or part of its name)
+                  or type one yourself: /model provider:model-name
   /keys           add or change API keys
+  /provider       add your own provider (name + base URL + key), or remove one
   /auto           toggle auto-approve (now: {'on' if state['auto'] else 'off'})
   /clear          start a new conversation
   /exit           quit        (Ctrl+C stops a running task)""")
@@ -401,6 +474,11 @@ def main():
             show(res, cur, False)
         elif text.startswith('/model '):
             choose(text[7:].strip())
+        elif text == '/provider':
+            manage_providers()
+            res, flat = refresh()
+            if not cur and flat:
+                cur = {'provider': flat[0]['provider'], 'model': flat[0]['id']}
         elif text == '/keys':
             add_keys()
             res, flat = refresh()

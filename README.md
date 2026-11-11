@@ -49,3 +49,11 @@ You can also add any OpenAI-compatible endpoint under "Custom provider". Free ti
 
 The server binds to `127.0.0.1` only, requires a random token (stored in `~/.free-agent/token`) and checks the Host header.
 API keys are stored in `~/.free-agent/config.json` (chmod 600). The agent can run commands, so keep approvals on for untrusted tasks.
+
+## Adding your own provider
+
+In the terminal chat type `/provider` (or press `p` in the `/keys` menu), choose `a`, then enter a name, the base URL (the one ending in `/v1`) and the API key. It checks the connection and lists the models it finds. If an API can't list its models, set one by hand with `/model name:model-id`.
+
+## Updating
+
+Run the install command again; it replaces the app and keeps your keys.
