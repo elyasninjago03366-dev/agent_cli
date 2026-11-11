@@ -106,7 +106,16 @@ BAD = re.compile(r'embed|whisper|tts|guard|moderation|rerank|dall-e|image|audio|
 
 def list_models(p):
     url = 'https://models.github.ai/catalog/models' if p['id'] == 'github' else p['base'] + '/models'
-    st, txt = http(url, p, timeout=10)
+    import time
+    st = txt = None
+    for attempt in range(3):  # slow/filtered networks often time out on the first TLS handshake
+        try:
+            st, txt = http(url, p, timeout=30)
+            break
+        except Exception as e:
+            if attempt == 2:
+                raise RuntimeError(f'network problem reaching {p["base"]}: {e}')
+            time.sleep(2)
     if st != 200:
         raise RuntimeError(f'HTTP {st} {txt[:150]}')
     j = json.loads(txt)
