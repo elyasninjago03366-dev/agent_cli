@@ -66,6 +66,20 @@ def set_key(pid, key):
 
 
 # ---------- http / models ----------
+RAW = []  # last raw server lines, saved to a file when a reply comes back empty
+
+
+def norm(c):
+    """Some providers return content as a list of parts ([{type:text,text:..}]) instead of a string."""
+    if isinstance(c, list):
+        return ''.join((x.get('text') or '') if isinstance(x, dict) else str(x) for x in c)
+    return c if isinstance(c, str) else ('' if c is None else str(c))
+
+
+def is_empty(m):
+    return not (norm(m.get('content')).strip() or m.get('tool_calls'))
+
+
 READ_TIMEOUT = int(os.environ.get('FA_TIMEOUT', '60'))
 
 
@@ -175,12 +189,31 @@ def chat(p, body):
     raise RuntimeError(last)
 
 
+def get_reply(p, body, show):
+    """Streaming first; if the model answers with nothing, retry non-streaming, then with a nudge."""
+    msg, streamed = chat_stream(p, body, show)
+    if not is_empty(msg):
+        return msg, streamed
+    steps = [('retrying without streaming', body),
+             ('nudging the model to continue', dict(body, messages=body['messages'] + [{'role': 'user', 'content': 'Continue with the task. Use the tools to make progress, or say what is blocking you.'}]))]
+    for label, b in steps:
+        print(dim(f'  (empty reply - {label}…)'), flush=True)
+        data = chat(p, b)
+        m = data['choices'][0]['message']
+        m['content'] = norm(m.get('content')) or None
+        if not is_empty(m):
+            return m, False
+        RAW.append('[retry] ' + json.dumps(data)[:1500])
+    return msg, streamed
+
+
 def chat_stream(p, body, show):
     """Streaming request: returns (message, streamed). Calls show(text) as text arrives.
     Gives up if the server is silent for READ_TIMEOUT seconds, so the agent never hangs."""
     import time
     url = p['base'] + '/chat/completions'
     last = ''
+    del RAW[:]
     for i in range(3):
         try:
             r = urllib.request.urlopen(mkreq(url, p, dict(body, stream=True)), timeout=READ_TIMEOUT)
@@ -204,12 +237,17 @@ def chat_stream(p, body, show):
             raise RuntimeError(last)
         with r:
             if 'event-stream' not in (r.headers.get('content-type') or ''):
-                data = json.loads(r.read().decode('utf-8', 'replace'))
-                return data['choices'][0]['message'], False
+                raw = r.read().decode('utf-8', 'replace')
+                RAW.append(raw[:4000])
+                m0 = json.loads(raw)['choices'][0]['message']
+                m0['content'] = norm(m0.get('content')) or None
+                return m0, False
             content, calls = '', {}
             try:
                 for raw in r:
                     line = raw.decode('utf-8', 'replace').strip()
+                    if len(RAW) < 300:
+                        RAW.append(line[:500])
                     if not line.startswith('data:'):
                         continue
                     d = line[5:].strip()
@@ -222,12 +260,14 @@ def chat_stream(p, body, show):
                     if j.get('error'):
                         raise RuntimeError(str(j['error'])[:300])
                     dl = ((j.get('choices') or [{}])[0].get('delta')) or {}
-                    t = dl.get('content')
+                    t = norm(dl.get('content'))
                     if t:
                         show(t)
                         content += t
                     for tc in dl.get('tool_calls') or []:
                         k = tc.get('index', 0)
+                        if tc.get('id') and k in calls and calls[k]['id'] and calls[k]['id'] != tc['id']:
+                            k = max(calls) + 1  # provider sends several calls with the same/no index
                         c0 = calls.setdefault(k, {'id': None, 'type': 'function', 'function': {'name': '', 'arguments': ''}})
                         if tc.get('id'):
                             c0['id'] = tc['id']
@@ -382,7 +422,7 @@ def run_agent(state):
 
         print(dim('  … waiting for the model (Ctrl+C to stop)'), end='\r', flush=True)
         try:
-            msg, streamed = chat_stream(p, {'model': model, 'messages': [{'role': 'system', 'content': system_prompt(cwd)}] + messages, 'tools': TOOLS, 'tool_choice': 'auto'}, show)
+            msg, streamed = get_reply(p, {'model': model, 'messages': [{'role': 'system', 'content': system_prompt(cwd)}] + messages, 'tools': TOOLS, 'tool_choice': 'auto'}, show)
         except Exception as e:
             print('\x1b[2K', end='\r')
             print(rd(f'\n✗ {e}\nTip: if this model does not support tools or is rate-limited, pick another with /model.'))
@@ -392,7 +432,13 @@ def run_agent(state):
             print()
         calls = msg.get('tool_calls') or None
         if not msg.get('content') and not calls:
-            print(dim('\n(the model returned an empty reply - send your message again, or switch model with /model)'))
+            try:
+                os.makedirs(DIR, exist_ok=True)
+                with open(os.path.join(DIR, 'last-empty-reply.txt'), 'w') as f:
+                    f.write(f'model={model} provider={p["id"]}\n' + '\n'.join(RAW))
+            except Exception:
+                pass
+            print(dim('\n(the model returned an empty reply even after retrying - switch model with /model, or send your message again.\n what the server sent is saved in ~/.free-agent/last-empty-reply.txt)'))
             return
         m = {'role': 'assistant', 'content': msg.get('content') or (None if calls else '')}
         if calls:
