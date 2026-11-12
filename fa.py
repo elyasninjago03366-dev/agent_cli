@@ -66,15 +66,21 @@ def set_key(pid, key):
 
 
 # ---------- http / models ----------
-def http(url, p=None, body=None, timeout=20):
+READ_TIMEOUT = int(os.environ.get('FA_TIMEOUT', '60'))
+
+
+def mkreq(url, p=None, body=None):
     h = {'user-agent': 'free-agent/1.0', 'content-type': 'application/json'}
     if p and p.get('key'):
         h['authorization'] = 'Bearer ' + p['key']
     if p and p['id'] == 'openrouter':
         h['x-title'] = 'Free Agent'
-    req = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None, headers=h, method='POST' if body is not None else 'GET')
+    return urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None, headers=h, method='POST' if body is not None else 'GET')
+
+
+def http(url, p=None, body=None, timeout=20):
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(mkreq(url, p, body), timeout=timeout) as r:
             return r.status, r.read().decode('utf-8', 'replace')
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode('utf-8', 'replace')
@@ -123,7 +129,7 @@ def list_models(p):
     out = []
     for m in rows:
         mid = re.sub(r'^models/', '', str(m.get('id') or m.get('name') or ''))
-        if not mid or BAD.search(mid):
+        if not mid or (BAD.search(mid) and not p.get('custom')):
             continue
         if p['id'] == 'openrouter':
             pr = m.get('pricing') or {}
@@ -154,10 +160,11 @@ def all_models():
 
 
 def chat(p, body):
+    """Non-streaming request (fallback)."""
     import time
     last = ''
     for i in range(3):
-        st, txt = http(p['base'] + '/chat/completions', p, body, timeout=120)
+        st, txt = http(p['base'] + '/chat/completions', p, body, timeout=READ_TIMEOUT * 2)
         if st == 200:
             return json.loads(txt)
         last = f'HTTP {st}: {txt[:400]}'
@@ -165,6 +172,81 @@ def chat(p, body):
             time.sleep(1.5 * (i + 1) ** 2)
             continue
         break
+    raise RuntimeError(last)
+
+
+def chat_stream(p, body, show):
+    """Streaming request: returns (message, streamed). Calls show(text) as text arrives.
+    Gives up if the server is silent for READ_TIMEOUT seconds, so the agent never hangs."""
+    import time
+    url = p['base'] + '/chat/completions'
+    last = ''
+    for i in range(3):
+        try:
+            r = urllib.request.urlopen(mkreq(url, p, dict(body, stream=True)), timeout=READ_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            txt = e.read().decode('utf-8', 'replace')
+            if e.code in (400, 422) and 'stream' in txt.lower():
+                data = chat(p, body)
+                return data['choices'][0]['message'], False
+            last = f'HTTP {e.code}: {txt[:400]}'
+            if e.code == 429 or e.code >= 500:
+                w = 2 * (i + 1) ** 2
+                print(dim(f'\n  {last[:90]} - retrying in {w}s'))
+                time.sleep(w)
+                continue
+            raise RuntimeError(last)
+        except (urllib.error.URLError, OSError) as e:
+            last = f'network problem: {e}'
+            if i < 2:
+                time.sleep(2)
+                continue
+            raise RuntimeError(last)
+        with r:
+            if 'event-stream' not in (r.headers.get('content-type') or ''):
+                data = json.loads(r.read().decode('utf-8', 'replace'))
+                return data['choices'][0]['message'], False
+            content, calls = '', {}
+            try:
+                for raw in r:
+                    line = raw.decode('utf-8', 'replace').strip()
+                    if not line.startswith('data:'):
+                        continue
+                    d = line[5:].strip()
+                    if d == '[DONE]':
+                        break
+                    try:
+                        j = json.loads(d)
+                    except Exception:
+                        continue
+                    if j.get('error'):
+                        raise RuntimeError(str(j['error'])[:300])
+                    dl = ((j.get('choices') or [{}])[0].get('delta')) or {}
+                    t = dl.get('content')
+                    if t:
+                        show(t)
+                        content += t
+                    for tc in dl.get('tool_calls') or []:
+                        k = tc.get('index', 0)
+                        c0 = calls.setdefault(k, {'id': None, 'type': 'function', 'function': {'name': '', 'arguments': ''}})
+                        if tc.get('id'):
+                            c0['id'] = tc['id']
+                        f = tc.get('function') or {}
+                        nm = f.get('name')
+                        if nm and nm != c0['function']['name']:
+                            c0['function']['name'] += nm
+                        if f.get('arguments'):
+                            c0['function']['arguments'] += f['arguments']
+            except (TimeoutError, OSError) as e:
+                raise RuntimeError(f'the model stopped responding for {READ_TIMEOUT}s ({e}). Try again, or switch model with /model.')
+        msg = {'content': content or None}
+        if calls:
+            msg['tool_calls'] = []
+            for k in sorted(calls):
+                if not calls[k]['id']:
+                    calls[k]['id'] = f'call_{k}'
+                msg['tool_calls'].append(calls[k])
+        return msg, True
     raise RuntimeError(last)
 
 
@@ -253,22 +335,34 @@ def run_agent(state):
     p, model, messages, cwd = state['prov'], state['model'], state['messages'], state['cwd']
     repair(messages)
     for _ in range(30):
+        started = [False]
+
+        def show(t):
+            if not started[0]:
+                print('\x1b[2K', end='\r')
+                print()
+                started[0] = True
+            print(t, end='', flush=True)
+
+        print(dim('  … waiting for the model (Ctrl+C to stop)'), end='\r', flush=True)
         try:
-            data = chat(p, {'model': model, 'messages': [{'role': 'system', 'content': system_prompt(cwd)}] + messages, 'tools': TOOLS, 'tool_choice': 'auto'})
+            msg, streamed = chat_stream(p, {'model': model, 'messages': [{'role': 'system', 'content': system_prompt(cwd)}] + messages, 'tools': TOOLS, 'tool_choice': 'auto'}, show)
         except Exception as e:
+            print('\x1b[2K', end='\r')
             print(rd(f'\n✗ {e}\nTip: if this model does not support tools or is rate-limited, pick another with /model.'))
             return
-        try:
-            msg = data['choices'][0]['message']
-        except Exception:
-            print(rd('\n✗ Empty response: ' + json.dumps(data)[:300]))
-            return
+        print('\x1b[2K', end='\r')
+        if started[0]:
+            print()
         calls = msg.get('tool_calls') or None
+        if not msg.get('content') and not calls:
+            print(dim('\n(the model returned an empty reply - send your message again, or switch model with /model)'))
+            return
         m = {'role': 'assistant', 'content': msg.get('content') or (None if calls else '')}
         if calls:
             m['tool_calls'] = calls
         messages.append(m)
-        if msg.get('content'):
+        if msg.get('content') and not streamed:
             print('\n' + msg['content'])
         if not calls:
             return
@@ -397,7 +491,7 @@ def show(res, cur, everything):
             here = cur and cur['provider'] == p['id'] and cur['model'] == m['id']
             print(f"  {n:>3}. {yl('★') if i < 2 else ' '} {gr(m['id'] + '  ← current') if here else m['id']}")
         if not everything and len(p['models']) > 15:
-            print(dim(f"       … {len(p['models']) - 15} more (use /models all)"))
+            print(dim(f"       … {len(p['models']) - 15} more (use /models)"))
     print(dim('\nPick with /model <number> or /model <part of name>.  ★ = best ranked'))
 
 
@@ -468,7 +562,7 @@ def main():
             break
         if text == '/help':
             print(f"""
-  /models [all]   re-check every API and list all available AIs
+  /models         re-check every API and list ALL available AIs   (/models top = short list)
   /model <n|name> switch model (number from /models, or part of its name)
                   or type one yourself: /model provider:model-name
   /keys           add or change API keys
@@ -476,11 +570,11 @@ def main():
   /auto           toggle auto-approve (now: {'on' if state['auto'] else 'off'})
   /clear          start a new conversation
   /exit           quit        (Ctrl+C stops a running task)""")
-        elif text in ('/models', '/models all'):
+        elif text in ('/models', '/models all', '/models top'):
             res, flat = refresh()
-            show(res, cur, text.endswith('all'))
+            show(res, cur, not text.endswith('top'))
         elif text == '/model':
-            show(res, cur, False)
+            show(res, cur, True)
         elif text.startswith('/model '):
             choose(text[7:].strip())
         elif text == '/provider':

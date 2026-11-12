@@ -17,7 +17,7 @@ fa
 ```
 
 `fa` chats with the agent right in the terminal (no browser needed). It uses the Python edition (`fa.py`, no Node.js required), so it also works on devices where Node.js crashes. On first run it asks for a free API key.
-Terminal commands: `/models` (re-check every API and list all AIs), `/model <n|name>`, `/keys`, `/auto`, `/clear`, `/exit`. Ctrl+C stops a running task.
+Terminal commands: `/models` (re-check every API and list ALL AIs; `/models top` for a short list), `/model <n|name>`, `/keys`, `/auto`, `/clear`, `/exit`. Ctrl+C stops a running task.
 
 Prefer the web GUI? It needs a working Node.js: run `fa gui` and open the printed link. If `127.0.0.1` will not open (e.g. your browser is on ChromeOS but Termux runs in the Android container), use `fa gui --host 0.0.0.0` and try one of the printed LAN links, or just use the terminal mode.
 Keys can also be set with `fa set groq YOUR_KEY`.
