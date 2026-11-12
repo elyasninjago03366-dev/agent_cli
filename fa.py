@@ -257,7 +257,7 @@ def fn(name, desc, props, req):
 
 S = {'type': 'string'}
 TOOLS = [
-    fn('bash', 'Run a shell command in the working directory (60s timeout).', {'command': S}, ['command']),
+    fn('bash', 'Run a shell command in the working directory. Default timeout 60s (pass "timeout" in seconds, max 900, for installs/builds). Commands CANNOT read keyboard input: always use non-interactive flags (pkg install -y, etc).', {'command': S, 'timeout': {'type': 'number'}}, ['command']),
     fn('read_file', 'Read a text file. Optional 1-based line offset and line limit (default 400).', {'path': S, 'offset': {'type': 'number'}, 'limit': {'type': 'number'}}, ['path']),
     fn('write_file', 'Create or overwrite a file. Parent folders are created.', {'path': S, 'content': S}, ['path', 'content']),
     fn('edit_file', 'Replace one exact, unique occurrence of old_string with new_string in a file.', {'path': S, 'old_string': S, 'new_string': S}, ['path', 'old_string', 'new_string']),
@@ -269,15 +269,51 @@ def clip(s, n=8000):
     return s if len(s) <= n else s[:n] + f'\n...[truncated {len(s) - n} chars]'
 
 
+def run_bash(cmd, cwd, timeout):
+    """Run a shell command without ever hanging the agent: no keyboard input, own process group,
+    whole group killed on timeout / Ctrl+C, output shown live."""
+    import threading, signal
+    env = dict(os.environ, DEBIAN_FRONTEND='noninteractive', GIT_TERMINAL_PROMPT='0', PAGER='cat', GIT_PAGER='cat')
+    p = subprocess.Popen(['sh', '-c', cmd], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+    buf, shown = [], [0]
+
+    def reader():
+        for raw in iter(p.stdout.readline, b''):
+            line = raw.decode('utf-8', 'replace')
+            buf.append(line)
+            if shown[0] < 40:
+                print(dim('  │ ' + line.rstrip()[:160]), flush=True)
+            elif shown[0] == 40:
+                print(dim('  │ … (more output hidden, the agent still sees it)'), flush=True)
+            shown[0] += 1
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+
+    def kill():
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+    try:
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill()
+        p.wait()
+        buf.append(f'\n[timed out after {timeout}s and killed. If it needs longer, call bash again with a larger "timeout" (seconds). Commands cannot read keyboard input, so use non-interactive flags like -y.]')
+    except KeyboardInterrupt:
+        kill()
+        raise
+    t.join(2)
+    return clip(''.join(buf) or '(no output)') + f'\n[exit {p.returncode}]'
+
+
 def run_tool(name, a, cwd):
     ab = lambda p: os.path.normpath(os.path.join(cwd, p or '.'))
     try:
         if name == 'bash':
-            try:
-                r = subprocess.run(['sh', '-c', str(a.get('command', ''))], cwd=cwd, capture_output=True, text=True, timeout=60, errors='replace')
-                return clip((r.stdout + r.stderr) or '(no output)') + f'\n[exit {r.returncode}]'
-            except subprocess.TimeoutExpired as e:
-                return clip(((e.stdout or b'').decode('utf-8', 'replace') if isinstance(e.stdout, bytes) else (e.stdout or ''))) + '\n[timed out after 60s]'
+            return run_bash(str(a.get('command', '')), cwd, max(1, min(int(a.get('timeout') or 60), 900)))
         if name == 'read_file':
             with open(ab(a['path']), encoding='utf-8', errors='replace') as f:
                 lines = f.read().split('\n')
@@ -383,8 +419,11 @@ def run_agent(state):
                     print(dim('auto-approve on (/auto to toggle)'))
                 ok = a[:1] in ('y', 'a')
             out = run_tool(name, args, cwd) if ok else 'The user denied this action.'
-            o = '\n'.join(out.split('\n')[:8])
-            print(dim(o[:600] + ('…' if len(o) > 600 else '')))
+            if name == 'bash' and ok:
+                print(dim('  ' + out.split('\n')[-1]))
+            else:
+                o = '\n'.join(out.split('\n')[:8])
+                print(dim(o[:600] + ('…' if len(o) > 600 else '')))
             messages.append({'role': 'tool', 'tool_call_id': tc.get('id'), 'content': clip(out)})
     print(rd('\n✗ Step limit (30) reached. Send another message to continue.'))
 
